@@ -194,7 +194,8 @@ def run_benchmark(model_name):
     with open("easiest_100.json", "r") as f:
         easiest_problem_ids = json.load(f)
 
-    for problem_id in easiest_problem_ids[:5]:
+    problem_ids = easiest_problem_ids[:5]
+    for problem_id in problem_ids:
         if problem_id in problems:
             problem = problems[problem_id]
             result = test_problem(problem, model_name)
@@ -222,6 +223,7 @@ def run_benchmark(model_name):
     new_result = {
         "model": model_name,
         "wins_count": len(results["wins"]),
+        "problems_count": len(problem_ids),
         "wins": results["wins"],
         "fails": results["fails"],
         "model_timeout": results["model_timeout"],

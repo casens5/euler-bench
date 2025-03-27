@@ -74,17 +74,39 @@ def log_to_file(text: str, filename: str = "log.txt"):
 
 
 def extract_code(response):
-    # first try: triple-backtick block preceded by "solution:"
+    # Remove text between <think> tags temporarily
+    think_blocks = []
+    pattern_think = r"<think>(.*?)</think>"
+    cleaned_response = re.sub(
+        pattern_think,
+        lambda m: think_blocks.append(m.group(1)) or "",
+        response,
+        flags=re.DOTALL,
+    )
+
+    # first try: triple-backtick block preceded by "solution:" in non-think text
     pattern_solution = r"(?i)solution:\s*```(?:\w+\n)?(.*?)```"
-    match = re.search(pattern_solution, response, re.DOTALL)
+    match = re.search(pattern_solution, cleaned_response, re.DOTALL)
     if match:
         return match.group(1)
 
-    # fallback: first triple-backtick block regardless of preceding text
+    # second try: first triple-backtick block in non-think text
     pattern_fallback = r"```(?:\w+\n)?(.*?)```"
-    match = re.search(pattern_fallback, response, re.DOTALL)
+    match = re.search(pattern_fallback, cleaned_response, re.DOTALL)
     if match:
         return match.group(1)
+
+    # If no matches found, search in the think blocks
+    for think_block in think_blocks:
+        # Try solution pattern first
+        match = re.search(pattern_solution, think_block, re.DOTALL)
+        if match:
+            return match.group(1)
+
+        # Try fallback pattern
+        match = re.search(pattern_fallback, think_block, re.DOTALL)
+        if match:
+            return match.group(1)
 
     return None
 
@@ -111,21 +133,22 @@ def test_problem(problem, model_name):
     chain = prompt | model
 
     input_vars = {"question": problem["statement"]}
+    error_condition = None
 
     print("model responding")
     try:
-        with time_limit(900):
+        with time_limit(300):
             llm_response = chain.invoke(input_vars)
         print("model responded")
     except TimeoutException:
         print("model timed out")
-        return "model_timeout"
+        error_condition = "model_timeout"
+        return error_condition
 
     output = io.StringIO()
     sys.stdout = output
 
     namespace = {}
-    error_condition = None
 
     llm_code = extract_code(llm_response)
 
@@ -194,7 +217,7 @@ def run_benchmark(model_name):
     with open("easiest_100.json", "r") as f:
         easiest_problem_ids = json.load(f)
 
-    problem_ids = easiest_problem_ids[:5]
+    problem_ids = easiest_problem_ids
     for problem_id in problem_ids:
         if problem_id in problems:
             problem = problems[problem_id]

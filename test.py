@@ -1,12 +1,21 @@
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import PromptTemplate
 from langchain_ollama.llms import OllamaLLM
+from langchain_openai import ChatOpenAI
 import json
 import sys
 import io
 import re
 import subprocess
 import signal
+import dotenv
 from contextlib import contextmanager
+import psutil
+import os
+import threading
+import time
+
+
+dotenv.load_dotenv()
 
 
 def install_missing_packages(code: str):
@@ -111,8 +120,37 @@ def extract_code(response):
     return None
 
 
-def test_problem(problem, model_name):
-    print("beginning problem ", problem["id"], "\n\n")
+class ResourceMonitor:
+    def __init__(self, pid, max_cpu_percent=90, max_memory_gb=4):
+        self.pid = pid
+        self.max_cpu_percent = max_cpu_percent
+        self.max_memory_gb = max_memory_gb * 1024 * 1024 * 1024  # Convert GB to bytes
+        self.should_stop = False
+        self.resource_exceeded = False
+
+    def monitor(self):
+        try:
+            process = psutil.Process(self.pid)
+            while not self.should_stop:
+                # Check CPU usage
+                cpu_percent = process.cpu_percent(interval=0.5)
+                # Check memory usage
+                memory_info = process.memory_info()
+
+                if (
+                    cpu_percent > self.max_cpu_percent
+                    or memory_info.rss > self.max_memory_gb
+                ):
+                    self.resource_exceeded = True
+                    process.kill()
+                    break
+                time.sleep(0.5)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+
+def test_problem(problem, model_name, api="ollama"):
+    print("\n\nbeginning problem ", problem["id"])
     template = """
         Solve this math/programming challenge by writing a python script.  You can import any packages you need.  Solutions will be given a maximum of 60 seconds to execute using moderate hardware.  Format your solution like this:
 
@@ -128,8 +166,15 @@ def test_problem(problem, model_name):
         Question: {question}
     """
 
-    prompt = ChatPromptTemplate.from_template(template)
-    model = OllamaLLM(model=model_name)
+    prompt = PromptTemplate.from_template(template)
+
+    if api == "ollama":
+        model = OllamaLLM(model=model_name)
+    elif api == "openai":
+        model = ChatOpenAI(model=model_name)
+    else:
+        raise ValueError(f"Unsupported API: {api}")
+
     chain = prompt | model
 
     input_vars = {"question": problem["statement"]}
@@ -145,6 +190,9 @@ def test_problem(problem, model_name):
         error_condition = "model_timeout"
         return error_condition
 
+    if api == "openai":
+        llm_response = llm_response.content
+
     output = io.StringIO()
     sys.stdout = output
 
@@ -157,13 +205,27 @@ def test_problem(problem, model_name):
             install_missing_packages(llm_code)
             try:
                 with time_limit(60):
-                    exec(llm_code, namespace)
+                    # Start resource monitoring in a separate thread
+                    monitor = ResourceMonitor(os.getpid())
+                    monitor_thread = threading.Thread(target=monitor.monitor)
+                    monitor_thread.start()
 
-                    if "solution" in namespace:
-                        result = namespace["solution"]()
-                    else:
-                        print("no solution() function found in model's response")
-                        error_condition = "solution_not_found"
+                    try:
+                        exec(llm_code, namespace)
+
+                        if "solution" in namespace:
+                            result = namespace["solution"]()
+                        else:
+                            print("no solution() function found in model's response")
+                            error_condition = "solution_not_found"
+                    finally:
+                        # Stop the monitoring thread
+                        monitor.should_stop = True
+                        monitor_thread.join()
+
+                        if monitor.resource_exceeded:
+                            print("Solution exceeded resource limits")
+                            error_condition = "resource_limit_exceeded"
 
             except TimeoutException:
                 print("Solution timed out after 60 seconds")
@@ -195,10 +257,13 @@ def test_problem(problem, model_name):
 with open("problems.json", "r") as f:
     problems = json.load(f)
 
+# model_name = "gpt-4o-mini"
 model_name = "llama3.2:1b"
+# api = "openai"
+api = "ollama"
 
 
-def run_benchmark(model_name):
+def run_benchmark(model_name="llama3.2:1b", api="ollama"):
     print("lets go")
     results = {
         "wins": [],
@@ -209,19 +274,20 @@ def run_benchmark(model_name):
         "code_exec_fail": [],
         "package_install_fail": [],
         "regex_match_fail": [],
+        "resource_limit_exceeded": [],  # Add new error category
     }
 
     with open("problems.json", "r") as f:
         problems = {p["id"]: p for p in json.load(f)}
 
-    with open("easiest_100.json", "r") as f:
-        easiest_problem_ids = json.load(f)
+    with open("medium_300.json", "r") as f:
+        medium_problem_ids = json.load(f)
 
-    problem_ids = easiest_problem_ids
+    problem_ids = medium_problem_ids[:100]
     for problem_id in problem_ids:
         if problem_id in problems:
             problem = problems[problem_id]
-            result = test_problem(problem, model_name)
+            result = test_problem(problem, model_name, api)
             if result is True:
                 results["wins"].append(problem["id"])
             elif result is False:
@@ -255,6 +321,7 @@ def run_benchmark(model_name):
         "code_exec_fail": results["code_exec_fail"],
         "package_install_fail": results["package_install_fail"],
         "regex_match_fail": results["regex_match_fail"],
+        "resource_limit_exceeded": results["resource_limit_exceeded"],
     }
 
     print("Results:", new_result)
@@ -266,4 +333,4 @@ def run_benchmark(model_name):
     print("were done")
 
 
-run_benchmark(model_name)
+run_benchmark(model_name, api)
